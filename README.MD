@@ -13,74 +13,41 @@ sudo apt-get update
 sudo apt-get install -y zip make cmake g++ libjemalloc-dev libboost-dev libgoogle-glog-dev
 ```
 
-# Download
-
-```sh
-git clone https://github.com/DBOS-project/lotus.git
-```
-
 # Build
 
 ```
-./compile.sh
+mkdir -p build
+cd build
+cmake ..
+make -j
 ```
 
-# Reproducing Experiments
+# Example commands to run the project in a single host
 
-Note that the tutorial only works for Google Cloud Compute Engine.
-
-Make sure you have placed the source code folder under `~`.
-
-Make sure every node in the cluster has installed all the software dependencies.
-
-Make sure the benchmark has been compiled on every node using `compile.sh`.
-
-We assume the log files for transactions are placed under `/mnt/disks/nvme/`.
-
-The sample scripts provided run on 6 nodes.
-
-## Figure 9(a): Comparison with Non-Deterministic Systems
-
-1. Fill in `scripts/ips.txt` with ip addresses of the nodes you want to run the experiments on.
-2. Fill in `scripts/instance_names.txt` with corresponding instance names (Google Cloud Compute Engine instance name) of the nodes supplied in `scripts/ips.txt`.  
-4. Run the following bash code on the first node of the cluster to distribute benchmarking scripts to other nodes.
-```bash
-cd scripts
-#                           port to run the experiments on
-#                             |
-python distribute_script.py 1234 gc_2pl_mp_ycsb.py  us-central1-a # ----- Google Cloud region name
-#                                     |
-#                                 baseline-specific distribution script
-python distribute_script.py 1234 gc_sundial_mp_ycsb.py us-central1-a
-python distribute_script.py 1234 gc_hstore_mp_ycsb.py us-central1-a
-python distribute_script.py 1234 gc_lotus_mp_ycsb.py us-central1-a
 ```
-5. Run the following code on the first node of the cluster to start the benchmark
-```bash
-sh run_2pl_mp_ycsb.sh
-sh run_sundial_mp_ycsb.sh
-sh run_hstore_mp_ycsb.sh
-sh run_lotus_mp_ycsb_sync.sh
-```
-6. Results are placed under `~/exp_results` on the first node of the cluster.
+# TPCC
+./build/bench_tpcc --logtostderr=1 --id=0 --servers="127.0.0.1:1234" --threads=2 --partition_num=2 --granule_count=2000 \
+        --log_path= --persist_latency=0 --wal_group_commit_time=0 --wal_group_commit_size=0 \
+        --partitioner=hash --hstore_command_logging=false \
+        --replica_group=1 --lock_manager=0 --batch_flush=1 --lotus_async_repl=true --batch_size=0 \
+        --protocol=Sundial --query=mixed --neworder_dist=10 --payment_dist=15
 
-## Figure 10(a): Comparison with Deterministic Systems
+./build/bench_tpcc --logtostderr=1 --id=0 --servers="127.0.0.1:1234" --threads=2 --partition_num=2 --granule_count=2000 \
+        --log_path= --persist_latency=0 --wal_group_commit_time=0 --wal_group_commit_size=0 \
+        --partitioner=hash --hstore_command_logging=false \
+        --replica_group=1 --lock_manager=0 --batch_flush=1 --lotus_async_repl=true --batch_size=0 \
+        --protocol=HStore --query=mixed --neworder_dist=10 --payment_dist=15
 
-1. Fill in `scripts/ips.txt` with ip addresses of the nodes you want to run the experiments on.
-2. Fill in `scripts/instance_names.txt` with corresponding instance names (Google Cloud Compute Engine instance name) of the nodes supplied in `scripts/ips.txt`.  
-3. Fill in `scripts/ips_half.txt` with first half of the nodes from `scripts/ips.txt`. This is for Calvin and Aria baselines that only need to evaluate the performance of one replica (3 nodes).
-4. Fill in `scripts/instance_names_half.txt` with first half of the nodes from `scripts/instance_names.txt`. 
-5. Run the following bash code on the first node of the cluster to distribute benchmarking scripts to other nodes.
-```bash
-cd scripts
-python distribute_script_half.py 1234 gc_aria_mp_ycsb.py us-central1-a
-python distribute_script_half.py 1234 gc_calvin_mp_ycsb.py us-central1-a
-python distribute_script.py 1234 gc_lotus_mp_ycsb.py us-central1-a
+# YCSB
+./build/bench_ycsb --logtostderr=1 --id=0 --servers="127.0.0.1:1234" --threads=2 --partition_num=2 --granule_count=2000 \
+        --log_path= --persist_latency=0 --wal_group_commit_time=0 --wal_group_commit_size=0 \
+        --partitioner=hash --hstore_command_logging=false \
+        --replica_group=1 --lock_manager=0 --batch_flush=1 --lotus_async_repl=true --batch_size=0 \
+        --protocol=Sundial --keys=100000 --read_write_ratio=100 --zipf=0 --cross_ratio=10 --cross_part_num=2
+
+./build/bench_ycsb --logtostderr=1 --id=0 --servers="127.0.0.1:1234" --threads=2 --partition_num=2 --granule_count=2000 \
+        --log_path= --persist_latency=0 --wal_group_commit_time=0 --wal_group_commit_size=0 \
+        --partitioner=hash --hstore_command_logging=false \
+        --replica_group=1 --lock_manager=0 --batch_flush=1 --lotus_async_repl=true --batch_size=0 \
+        --protocol=HStore --keys=100000 --read_write_ratio=100 --zipf=0 --cross_ratio=10 --cross_part_num=2
 ```
-6. Run the following code on the first node of the cluster to start the benchmark
-```bash
-sh run_aria_mp_ycsb.sh
-sh run_calvin_mp_ycsb.sh
-sh run_lotus_mp_ycsb.sh
-```
-7. Results are placed under `~/exp_results` on the first node of the cluster.
