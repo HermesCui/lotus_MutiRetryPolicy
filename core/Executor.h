@@ -1,7 +1,3 @@
-//
-// Created by Yi Lu on 8/29/18.
-//
-
 #pragma once
 
 #include "common/Percentile.h"
@@ -16,6 +12,8 @@
 
 #include <chrono>
 #include <thread>
+#include <algorithm>
+#include <queue>
 
 namespace star {
 
@@ -30,8 +28,41 @@ public:
   using MessageType = typename ProtocolType::MessageType;
   using MessageFactoryType = typename ProtocolType::MessageFactoryType;
   using MessageHandlerType = typename ProtocolType::MessageHandlerType;
-
   using StorageType = typename WorkloadType::StorageType;
+
+private:
+struct CompareRetryTime {
+    bool operator()(const std::pair<uint64_t, std::unique_ptr<TransactionType>>& lhs,
+                    const std::pair<uint64_t, std::unique_ptr<TransactionType>>& rhs) const {
+        return lhs.first > rhs.first;
+    }
+};
+
+  std::priority_queue<
+      std::pair<uint64_t, std::unique_ptr<TransactionType>>,
+      std::vector<std::pair<uint64_t, std::unique_ptr<TransactionType>>>,
+      CompareRetryTime> retry_queue;
+
+  std::mutex retry_queue_mutex;
+
+
+  uint64_t get_next_retry_time(uint32_t retry_count) {
+    const uint64_t base_delay = random.uniform_dist(0, context.sleep_time); // microseconds
+    const uint64_t max_delay = 10; // max backoff of 1ms
+    
+    uint64_t delay = std::min<uint64_t>(
+      base_delay * (1ULL << retry_count),
+      max_delay
+    );
+    
+    delay += random.uniform_dist(0, delay/4);
+    
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()
+    ).count()) + delay;
+  }
+
+public:
   Executor(std::size_t coordinator_id, std::size_t id, DatabaseType &db,
            const ContextType &context, std::atomic<uint32_t> &worker_status,
            std::atomic<uint32_t> &n_complete_workers,
@@ -68,14 +99,10 @@ public:
     }
   }
 
-  ~Executor() = default;
-
   void start() override {
-
     LOG(INFO) << "Executor " << id << " starts.";
 
     uint64_t last_seed = 0;
-
     ExecutorStatus status;
 
     while ((status = static_cast<ExecutorStatus>(worker_status.load())) !=
@@ -84,38 +111,41 @@ public:
     }
 
     n_started_workers.fetch_add(1);
-    bool retry_transaction = false;
 
-    //auto startTime = std::chrono::steady_clock::now();
     auto t = workload.next_transaction(context, 0, this->id);
     auto dummy_transaction = t.release();
     setupHandlers(*dummy_transaction);
+
     do {
       auto tmp_transaction = transaction.get();
+      
       bool replace_with_dummy = tmp_transaction == nullptr;
       if (replace_with_dummy) {
-        // Hack: Make sure transaction is not nullptr
         transaction.reset(dummy_transaction);
       }
       process_request();
       if (replace_with_dummy) {
-        // swap it back.
         transaction.reset(tmp_transaction);
       }
 
       if (!partitioner->is_backup()) {
-        // backup node stands by for replication
-        last_seed = random.get_seed();
+        auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()
+        ).count());
 
-        if (retry_transaction) {
-          transaction->reset();
+        bool should_retry = false;
+        std::lock_guard<std::mutex> lock(retry_queue_mutex);
+        if (!retry_queue.empty() && retry_queue.top().first <= now) {
+          transaction = std::move(const_cast<std::pair<uint64_t, std::unique_ptr<TransactionType>>&>(
+            retry_queue.top()).second);
+          retry_queue.pop();
+          transaction->startTime = std::chrono::steady_clock::now();
+          should_retry = true;
         } else {
-
+          last_seed = random.get_seed();
           auto partition_id = get_partition_id();
-
-          transaction =
-              workload.next_transaction(context, partition_id, this->id);
-          //startTime = std::chrono::steady_clock::now();
+          transaction = workload.next_transaction(context, partition_id, this->id);
+          transaction->startTime = std::chrono::steady_clock::now();
           setupHandlers(*transaction);
         }
 
@@ -127,21 +157,23 @@ public:
               if (commit) {
                 this->transaction->record_commit_work_time(us);
               } else {
-                auto ltc =
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - transaction->startTime)
-                    .count();
+                auto ltc = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - transaction->startTime
+                ).count();
                 this->transaction->set_stall_time(ltc);
               }
             });
             commit = protocol.commit(*transaction, messages);
           }
+
           auto ltc = std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - transaction->startTime)
-                    .count();
+                    std::chrono::steady_clock::now() - transaction->startTime
+                    ).count();
           commit_latency.add(ltc);
           n_network_size.fetch_add(transaction->network_size);
+
           if (commit) {
+            transaction->retry_count = 0;
             n_commit.fetch_add(1);
             if (transaction->si_in_serializable) {
               n_si_in_serializable.fetch_add(1);
@@ -149,11 +181,9 @@ public:
             if (transaction->local_validated) {
               n_local.fetch_add(1);
             }
-            retry_transaction = false;
-            auto latency =
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - transaction->startTime)
-                    .count();
+            auto latency = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - transaction->startTime
+            ).count();
             percentile.add(latency);
             if (transaction->is_single_partition() == false) {
               dist_latency.add(latency);
@@ -168,12 +198,18 @@ public:
               DCHECK(transaction->abort_read_validation);
               n_abort_read_validation.fetch_add(1);
             }
-            if (context.sleep_on_retry) {
-              std::this_thread::sleep_for(std::chrono::microseconds(
-                  random.uniform_dist(0, context.sleep_time)));
+
+            transaction->retry_count++;
+            std::lock_guard<std::mutex> lock(retry_queue_mutex);
+            if (transaction->retry_count < 3) {
+              retry_queue.push(std::make_pair(get_next_retry_time(transaction->retry_count),std::move(transaction)));
+            } else {
+              n_abort_no_retry.fetch_add(1);
             }
-            random.set_seed(last_seed);
-            retry_transaction = true;
+
+            if (should_retry) {
+              random.set_seed(last_seed);
+            }
           }
         } else {
           protocol.abort(*transaction, messages);
@@ -185,9 +221,6 @@ public:
     } while (status != ExecutorStatus::STOP);
 
     n_complete_workers.fetch_add(1);
-
-    // once all workers are stop, we need to process the replication
-    // requests
 
     while (static_cast<ExecutorStatus>(worker_status.load()) !=
            ExecutorStatus::CLEANUP) {
