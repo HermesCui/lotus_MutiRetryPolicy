@@ -16,6 +16,7 @@
 
 #include <chrono>
 #include <thread>
+#include <algorithm>
 
 namespace star {
 
@@ -92,6 +93,7 @@ public:
     setupHandlers(*dummy_transaction);
     do {
       auto tmp_transaction = transaction.get();
+      
       bool replace_with_dummy = tmp_transaction == nullptr;
       if (replace_with_dummy) {
         // Hack: Make sure transaction is not nullptr
@@ -142,6 +144,12 @@ public:
           commit_latency.add(ltc);
           n_network_size.fetch_add(transaction->network_size);
           if (commit) {
+
+            //re-set the retry count
+
+            transaction->retry_count = 0;
+
+
             n_commit.fetch_add(1);
             if (transaction->si_in_serializable) {
               n_si_in_serializable.fetch_add(1);
@@ -168,9 +176,41 @@ public:
               DCHECK(transaction->abort_read_validation);
               n_abort_read_validation.fetch_add(1);
             }
+
+
+            if (transaction->retry_count >= 5) {
+                n_abort_no_retry.fetch_add(1);
+                retry_transaction = false;  
+                continue; 
+            }
+
+
             if (context.sleep_on_retry) {
-              std::this_thread::sleep_for(std::chrono::microseconds(
-                  random.uniform_dist(0, context.sleep_time)));
+              // std::this_thread::sleep_for(std::chrono::microseconds(
+              //     random.uniform_dist(0, context.sleep_time)));
+
+              const uint64_t max_wait_time = 10;  
+              uint64_t base_wait_time = 
+                  random.uniform_dist(0, context.sleep_time);
+
+
+              uint64_t backoff_time = std::min<uint64_t>(
+                        base_wait_time * (1ULL << transaction->retry_count),
+                        max_wait_time);
+
+              // LOG(INFO) << "Executor: Transaction " << transaction->transaction_id
+              //           << " retry count: " << transaction->retry_count
+              //           << ", backoff time: " << backoff_time << " microseconds.";
+            //   if (transaction->retry_count > 2) {
+            // LOG(INFO) << "Executor: Transaction " << transaction->transaction_id
+            //           << " retrying with count: " << transaction->retry_count
+            //           << ", backoff time: " << backoff_time << " microseconds.";
+            //   }
+
+              std::this_thread::sleep_for(std::chrono::microseconds(backoff_time));
+
+
+              transaction->retry_count++;
             }
             random.set_seed(last_seed);
             retry_transaction = true;
