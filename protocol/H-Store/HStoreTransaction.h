@@ -123,6 +123,7 @@ public:
   std::size_t commit_prepare_time_us = 0;
   std::size_t commit_persistence_time_us = 0;
   std::size_t commit_replication_time_us = 0;
+  std::size_t retry_count = 0;
   virtual void record_commit_replication_time(uint64_t us) {
     commit_replication_time_us += us;
   }
