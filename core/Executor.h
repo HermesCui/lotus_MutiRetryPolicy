@@ -139,13 +139,13 @@ public:
           transaction = std::move(const_cast<std::pair<uint64_t, std::unique_ptr<TransactionType>>&>(
             retry_queue.top()).second);
           retry_queue.pop();
-          transaction->startTime = std::chrono::steady_clock::now();
+
           should_retry = true;
         } else {
           last_seed = random.get_seed();
           auto partition_id = get_partition_id();
           transaction = workload.next_transaction(context, partition_id, this->id);
-          transaction->startTime = std::chrono::steady_clock::now();
+
           setupHandlers(*transaction);
         }
 
@@ -157,10 +157,13 @@ public:
               if (commit) {
                 this->transaction->record_commit_work_time(us);
               } else {
-                auto ltc = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - transaction->startTime
-                ).count();
-                this->transaction->set_stall_time(ltc);
+                                
+                  auto ltc = std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now() - transaction->startTime
+                  ).count();
+                  
+                  
+                  this->transaction->set_stall_time(ltc);
               }
             });
             commit = protocol.commit(*transaction, messages);
@@ -169,6 +172,8 @@ public:
           auto ltc = std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - transaction->startTime
                     ).count();
+
+
           commit_latency.add(ltc);
           n_network_size.fetch_add(transaction->network_size);
 
@@ -184,6 +189,20 @@ public:
             auto latency = std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - transaction->startTime
             ).count();
+
+
+                  // auto now = std::chrono::steady_clock::now();
+                  // auto start = transaction->startTime;
+                  
+                  // LOG(INFO) << "Transaction " << transaction->transaction_id  
+                  //           << " start time: " << std::chrono::duration_cast<std::chrono::microseconds>(
+                  //               start.time_since_epoch()).count() 
+                  //           << " now: " << std::chrono::duration_cast<std::chrono::microseconds>(
+                  //               now.time_since_epoch()).count();
+
+
+                  //           LOG(INFO) << "Calculated stall time: " << latency << " us";
+
             percentile.add(latency);
             if (transaction->is_single_partition() == false) {
               dist_latency.add(latency);
