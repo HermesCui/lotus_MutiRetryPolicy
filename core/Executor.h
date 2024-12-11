@@ -14,6 +14,7 @@
 #include <thread>
 #include <algorithm>
 #include <queue>
+#include <memory>
 
 namespace star {
 
@@ -28,38 +29,39 @@ public:
   using MessageType = typename ProtocolType::MessageType;
   using MessageFactoryType = typename ProtocolType::MessageFactoryType;
   using MessageHandlerType = typename ProtocolType::MessageHandlerType;
+
   using StorageType = typename WorkloadType::StorageType;
 
 private:
-struct CompareRetryTime {
-    bool operator()(const std::pair<uint64_t, std::unique_ptr<TransactionType>>& lhs,
-                    const std::pair<uint64_t, std::unique_ptr<TransactionType>>& rhs) const {
-        return lhs.first > rhs.first;
+  struct CompareRetryTime {
+    bool operator()(const std::pair<uint64_t, std::shared_ptr<TransactionType>> &lhs,
+                    const std::pair<uint64_t, std::shared_ptr<TransactionType>> &rhs) const {
+      return lhs.first > rhs.first;
     }
-};
+  };
 
   std::priority_queue<
-      std::pair<uint64_t, std::unique_ptr<TransactionType>>,
-      std::vector<std::pair<uint64_t, std::unique_ptr<TransactionType>>>,
-      CompareRetryTime> retry_queue;
-
-  std::mutex retry_queue_mutex;
-
+      std::pair<uint64_t, std::shared_ptr<TransactionType>>,
+      std::vector<std::pair<uint64_t, std::shared_ptr<TransactionType>>>,
+      CompareRetryTime
+  > retry_queue;
 
   uint64_t get_next_retry_time(uint32_t retry_count) {
     const uint64_t base_delay = random.uniform_dist(0, context.sleep_time); // microseconds
-    const uint64_t max_delay = 10; // max backoff of 1ms
+    const uint64_t max_delay = 200; 
     
     uint64_t delay = std::min<uint64_t>(
       base_delay * (1ULL << retry_count),
       max_delay
     );
     
-    delay += random.uniform_dist(0, delay/4);
-    
-    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-      std::chrono::steady_clock::now().time_since_epoch()
-    ).count()) + delay;
+    delay += random.uniform_dist(0, delay / 4);
+
+    uint64_t now = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+
+    return now + delay;
   }
 
 public:
@@ -99,6 +101,8 @@ public:
     }
   }
 
+  ~Executor() = default;
+
   void start() override {
     LOG(INFO) << "Executor " << id << " starts.";
 
@@ -112,40 +116,34 @@ public:
 
     n_started_workers.fetch_add(1);
 
-    auto t = workload.next_transaction(context, 0, this->id);
-    auto dummy_transaction = t.release();
-    setupHandlers(*dummy_transaction);
+    {
+      auto t = workload.next_transaction(context, 0, this->id);
+      auto dummy_transaction = std::shared_ptr<TransactionType>(t.release());
+      setupHandlers(*dummy_transaction);
+      transaction = dummy_transaction;
+    }
 
     do {
-      auto tmp_transaction = transaction.get();
-      
-      bool replace_with_dummy = tmp_transaction == nullptr;
-      if (replace_with_dummy) {
-        transaction.reset(dummy_transaction);
-      }
+      auto tmp_transaction = transaction;
+      bool replace_with_dummy = (tmp_transaction == nullptr);
       process_request();
-      if (replace_with_dummy) {
-        transaction.reset(tmp_transaction);
-      }
 
       if (!partitioner->is_backup()) {
-        auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-          std::chrono::steady_clock::now().time_since_epoch()
-        ).count());
+        uint64_t now = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
 
         bool should_retry = false;
-        std::lock_guard<std::mutex> lock(retry_queue_mutex);
         if (!retry_queue.empty() && retry_queue.top().first <= now) {
-          transaction = std::move(const_cast<std::pair<uint64_t, std::unique_ptr<TransactionType>>&>(
-            retry_queue.top()).second);
+          auto topElem = retry_queue.top();
           retry_queue.pop();
-
+          transaction = topElem.second;
           should_retry = true;
         } else {
           last_seed = random.get_seed();
           auto partition_id = get_partition_id();
-          transaction = workload.next_transaction(context, partition_id, this->id);
-
+          auto new_t = workload.next_transaction(context, partition_id, this->id);
+          transaction = std::shared_ptr<TransactionType>(new_t.release());
           setupHandlers(*transaction);
         }
 
@@ -153,27 +151,23 @@ public:
         if (result == TransactionResult::READY_TO_COMMIT) {
           bool commit;
           {
-            ScopedTimer t([&, this](uint64_t us) {
+            ScopedTimer timer([&, this](uint64_t us) {
               if (commit) {
                 this->transaction->record_commit_work_time(us);
               } else {
-                                
-                  auto ltc = std::chrono::duration_cast<std::chrono::microseconds>(
-                      std::chrono::steady_clock::now() - transaction->startTime
-                  ).count();
-                  
-                  
-                  this->transaction->set_stall_time(ltc);
+                auto ltc = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - transaction->startTime
+                ).count();
+                this->transaction->set_stall_time(ltc);
               }
             });
+
             commit = protocol.commit(*transaction, messages);
           }
 
           auto ltc = std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - transaction->startTime
-                    ).count();
-
-
+                      std::chrono::steady_clock::now() - transaction->startTime
+                      ).count();
           commit_latency.add(ltc);
           n_network_size.fetch_add(transaction->network_size);
 
@@ -189,27 +183,13 @@ public:
             auto latency = std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - transaction->startTime
             ).count();
-
-
-                  // auto now = std::chrono::steady_clock::now();
-                  // auto start = transaction->startTime;
-                  
-                  // LOG(INFO) << "Transaction " << transaction->transaction_id  
-                  //           << " start time: " << std::chrono::duration_cast<std::chrono::microseconds>(
-                  //               start.time_since_epoch()).count() 
-                  //           << " now: " << std::chrono::duration_cast<std::chrono::microseconds>(
-                  //               now.time_since_epoch()).count();
-
-
-                  //           LOG(INFO) << "Calculated stall time: " << latency << " us";
-
             percentile.add(latency);
-            if (transaction->is_single_partition() == false) {
+            if (!transaction->is_single_partition()) {
               dist_latency.add(latency);
             } else {
               local_latency.add(latency);
             }
-            record_txn_breakdown_stats(*transaction.get());
+            record_txn_breakdown_stats(*transaction);
           } else {
             if (transaction->abort_lock) {
               n_abort_lock.fetch_add(1);
@@ -219,15 +199,18 @@ public:
             }
 
             transaction->retry_count++;
-            std::lock_guard<std::mutex> lock(retry_queue_mutex);
-            if (transaction->retry_count < 3) {
-              retry_queue.push(std::make_pair(get_next_retry_time(transaction->retry_count),std::move(transaction)));
+            if (transaction->retry_count < 1000000) {
+
+              transaction->reset(); 
+              uint64_t retryTime = get_next_retry_time(transaction->retry_count);
+              retry_queue.push(std::make_pair(retryTime, transaction));
+
+              if (should_retry) {
+                random.set_seed(last_seed);
+              }
+
             } else {
               n_abort_no_retry.fetch_add(1);
-            }
-
-            if (should_retry) {
-              random.set_seed(last_seed);
             }
           }
         } else {
@@ -253,7 +236,6 @@ public:
   }
 
   void onExit() override {
-
     LOG(INFO) << "Worker " << id << " latency: " << percentile.nth(50)
               << " us (50%) " << percentile.nth(75) << " us (75%) "
               << percentile.nth(95) << " us (95%) " << percentile.nth(99)
@@ -299,9 +281,7 @@ public:
   }
 
   std::size_t get_partition_id() {
-
     std::size_t partition_id;
-
     if (context.partitioner == "pb") {
       partition_id = random.uniform_dist(0, context.partition_num - 1);
     } else {
@@ -324,28 +304,14 @@ public:
   Message *pop_message() override {
     if (out_queue.empty())
       return nullptr;
-
     Message *message = out_queue.front();
-
-    // if (delay->delay_enabled()) {
-    //   auto now = std::chrono::steady_clock::now();
-    //   if (std::chrono::duration_cast<std::chrono::microseconds>(now -
-    //                                                             message->time)
-    //           .count() < delay->message_delay()) {
-    //     return nullptr;
-    //   }
-    // }
-
     bool ok = out_queue.pop();
     CHECK(ok);
-
     return message;
   }
 
   std::size_t process_request() {
-
     std::size_t size = 0;
-
     while (!in_queue.empty()) {
       size++;
       std::unique_ptr<Message> message(in_queue.front());
@@ -353,7 +319,6 @@ public:
       CHECK(ok);
 
       for (auto it = message->begin(); it != message->end(); it++) {
-
         MessagePiece messagePiece = *it;
         auto type = messagePiece.get_message_type();
         DCHECK(type < messageHandlers.size());
@@ -377,7 +342,6 @@ public:
   virtual void setupHandlers(TransactionType &txn) = 0;
 
   virtual void flush_messages() {
-
     for (auto i = 0u; i < messages.size(); i++) {
       if (i == coordinator_id) {
         continue;
@@ -413,10 +377,18 @@ public:
   WorkloadType workload;
   std::unique_ptr<Delay> delay;
   Percentile<int64_t> percentile, dist_latency, local_latency, commit_latency; 
-  Percentile<uint64_t> local_txn_stall_time_pct, local_txn_commit_work_time_pct, local_txn_commit_persistence_time_pct, local_txn_commit_prepare_time_pct, local_txn_commit_replication_time_pct, local_txn_commit_write_back_time_pct, local_txn_commit_unlock_time_pct, local_txn_local_work_time_pct, local_txn_remote_work_time_pct;
+  Percentile<uint64_t> local_txn_stall_time_pct, local_txn_commit_work_time_pct, 
+      local_txn_commit_persistence_time_pct, local_txn_commit_prepare_time_pct,
+      local_txn_commit_replication_time_pct, local_txn_commit_write_back_time_pct,
+      local_txn_commit_unlock_time_pct, local_txn_local_work_time_pct,
+      local_txn_remote_work_time_pct;
   Percentile<uint64_t> dist_txn_stall_time_pct, dist_txn_commit_work_time_pct, 
-  dist_txn_commit_persistence_time_pct, dist_txn_commit_prepare_time_pct,dist_txn_commit_write_back_time_pct, dist_txn_commit_unlock_time_pct, dist_txn_local_work_time_pct, dist_txn_commit_replication_time_pct, dist_txn_remote_work_time_pct;
-  std::unique_ptr<TransactionType> transaction;
+      dist_txn_commit_persistence_time_pct, dist_txn_commit_prepare_time_pct,
+      dist_txn_commit_write_back_time_pct, dist_txn_commit_unlock_time_pct,
+      dist_txn_local_work_time_pct, dist_txn_commit_replication_time_pct,
+      dist_txn_remote_work_time_pct;
+
+  std::shared_ptr<TransactionType> transaction; 
   std::unique_ptr<TransactionType> transaction_replica;
   std::vector<std::unique_ptr<Message>> messages;
   std::vector<
@@ -428,6 +400,7 @@ public:
   LockfreeQueue<Message *> out_queue;
 
   WALLogger * logger = nullptr;
+
   void record_txn_breakdown_stats(TransactionType & txn) {
     if (txn.is_single_partition()) {
       local_txn_stall_time_pct.add(txn.get_stall_time());
