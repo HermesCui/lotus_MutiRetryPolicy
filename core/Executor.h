@@ -185,33 +185,25 @@ public:
             }
 
 
-            if (context.sleep_on_retry) {
-              // std::this_thread::sleep_for(std::chrono::microseconds(
-              //     random.uniform_dist(0, context.sleep_time)));
+            // if (context.sleep_on_retry) {
+            //   // std::this_thread::sleep_for(std::chrono::microseconds(
+            //   //     random.uniform_dist(0, context.sleep_time)));
 
-              const uint64_t max_wait_time = 10;  
-              uint64_t base_wait_time = 
-                  random.uniform_dist(0, context.sleep_time);
-
-
-              uint64_t backoff_time = std::min<uint64_t>(
-                        base_wait_time * (1ULL << transaction->retry_count),
-                        max_wait_time);
-
-              // LOG(INFO) << "Executor: Transaction " << transaction->transaction_id
-              //           << " retry count: " << transaction->retry_count
-              //           << ", backoff time: " << backoff_time << " microseconds.";
-            //   if (transaction->retry_count > 2) {
-            // LOG(INFO) << "Executor: Transaction " << transaction->transaction_id
-            //           << " retrying with count: " << transaction->retry_count
-            //           << ", backoff time: " << backoff_time << " microseconds.";
-            //   }
-
-              std::this_thread::sleep_for(std::chrono::microseconds(backoff_time));
+            //   const uint64_t max_wait_time = 10;  
+            //   uint64_t base_wait_time = 
+            //       random.uniform_dist(0, context.sleep_time);
 
 
-              transaction->retry_count++;
-            }
+            //   uint64_t backoff_time = std::min<uint64_t>(
+            //             base_wait_time * (1ULL << transaction->retry_count),
+            //             max_wait_time);
+
+            //   std::this_thread::sleep_for(std::chrono::microseconds(backoff_time));
+
+
+              
+            // }
+            transaction->retry_count++;
             random.set_seed(last_seed);
             retry_transaction = true;
           }
